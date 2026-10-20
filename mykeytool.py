@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import sys
+from datetime import datetime
 from getpass import getpass
 
 from cryptography import x509
@@ -132,9 +133,17 @@ def comando_genkey():
         encryption_algorithm=serialization.BestAvailableEncryption(alias_pass.encode("utf-8")),
     ).decode("utf-8")
 
+    # La clave pública no es secreta: se guarda para poder listar la huella sin pedir la clave del alias
+    clave_publica_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+
     keystore[alias] = {
         "dn": {"CN": cn, "OU": ou, "O": o, "L": l, "ST": st, "C": c.upper()},
         "private_key": clave_privada_pem,
+        "public_key": clave_publica_pem,
+        "fecha_creacion": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
     }
 
     guardar_keystore(password, keystore)
@@ -208,6 +217,82 @@ def comando_certreq():
     print(f"\nSolicitud de Firma de Certificado (CSR) generada con éxito: '{archivo_csr}'")
 
 
+def huella_sha256(pem_publica: str) -> str:
+    """Huella SHA-256 de la clave pública (como la que muestra keytool -list)."""
+    clave = serialization.load_pem_public_key(pem_publica.encode("utf-8"))
+    der = clave.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    resumen = hashes.Hash(hashes.SHA256())
+    resumen.update(der)
+    return ":".join(f"{b:02X}" for b in resumen.finalize())
+
+
+def formatear_dn(dn: dict) -> str:
+    """Convierte el DN guardado en una cadena tipo 'CN=..., OU=..., O=...'."""
+    return ", ".join(f"{k}={dn[k]}" for k in ("CN", "OU", "O", "L", "ST", "C") if dn.get(k))
+
+
+def comando_list():
+    """Equivalente a 'keytool -list': muestra la información pública de cada entrada."""
+    if not os.path.exists(KEYSTORE_FILE):
+        print(f"\nError: No existe el archivo KeyStore '{KEYSTORE_FILE}'. Ejecuta primero --genkey.")
+        return
+
+    password = getpass("Introduce la contraseña del KeyStore: ")
+    if not password:
+        print("\nError: La contraseña del KeyStore no puede estar vacía.")
+        return
+
+    keystore = cargar_keystore(password)
+
+    if not keystore:
+        print("\nEl almacén de claves está vacío.")
+        return
+
+    print(f"\nEl almacén de claves contiene {len(keystore)} entrada(s):")
+    for alias, entrada in keystore.items():
+        print(f"\nAlias: {alias}")
+        print(f"Fecha de creación: {entrada.get('fecha_creacion', 'desconocida')}")
+        print("Tipo de entrada: PrivateKeyEntry")
+        print(f"Titular: {formatear_dn(entrada.get('dn', {}))}")
+        if entrada.get("public_key"):
+            print(f"Huella de la clave pública (SHA-256): {huella_sha256(entrada['public_key'])}")
+        else:
+            print("Huella de la clave pública (SHA-256): no disponible (entrada creada con una versión anterior)")
+
+
+def comando_delete():
+    """Equivalente a 'keytool -delete': elimina un alias del KeyStore."""
+    if not os.path.exists(KEYSTORE_FILE):
+        print(f"\nError: No existe el archivo KeyStore '{KEYSTORE_FILE}'. Ejecuta primero --genkey.")
+        return
+
+    password = getpass("Introduce la contraseña del KeyStore: ")
+    if not password:
+        print("\nError: La contraseña del KeyStore no puede estar vacía.")
+        return
+
+    keystore = cargar_keystore(password)
+
+    alias = input("Introduce el alias que quieres eliminar: ").strip()
+    if alias not in keystore:
+        print(f"\nError: El alias '{alias}' no existe en el almacén.")
+        return
+
+    confirmacion = input(
+        f"¿Seguro que quieres eliminar '{alias}'? Esta acción no se puede deshacer (s/N): "
+    ).strip().lower()
+    if confirmacion != "s":
+        print("Operación cancelada. No se ha eliminado nada.")
+        return
+
+    del keystore[alias]
+    guardar_keystore(password, keystore)
+    print(f"Alias '{alias}' eliminado correctamente del almacén.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mykeytool",
@@ -218,6 +303,8 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--genkey", action="store_true", help="Genera un par de claves y las almacena.")
     group.add_argument("--certreq", action="store_true", help="Genera un CSR a partir de una clave.")
+    group.add_argument("--list", action="store_true", help="Lista las entradas del KeyStore.")
+    group.add_argument("--delete", action="store_true", help="Elimina un alias del KeyStore.")
 
     args = parser.parse_args()
 
@@ -226,6 +313,10 @@ def main():
             comando_genkey()
         elif args.certreq:
             comando_certreq()
+        elif args.list:
+            comando_list()
+        elif args.delete:
+            comando_delete()
     except KeyboardInterrupt:
         print("\n\nOperación cancelada por el usuario.")
         sys.exit(1)
